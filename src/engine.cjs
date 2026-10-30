@@ -46,7 +46,7 @@ class Engine extends EventEmitter {
     const cat=data.category||(['media','site'].includes(mode)?(data.quality==='audio'?'music':'video'):category(name));
     const item=this.store.add({url:u.href,name,category:cat,queueId:data.queueId||'main',
       directory:data.directory||this.settings().categoryFolders?.[cat]||this.settings().downloadDir,
-      description:String(data.description||''),meta:JSON.stringify({headers:data.headers||{},autoName:!data.name,autoCategory:!data.category,autoDirectory:!data.directory,speedLimit:Number(data.speedLimit)||0,priority:Number(data.priority)||0,ruleId:data.ruleId||'',ruleName:data.ruleName||'',mode,quality:data.quality||'best',audioURL:data.audioURL||'',format:data.format||'mp4',sourcePage:data.sourcePage||''})});
+      description:String(data.description||''),meta:JSON.stringify({headers:data.headers||{},autoName:!data.name,autoCategory:!data.category,autoDirectory:!data.directory,speedLimit:Number(data.speedLimit)||0,priority:Number(data.priority)||0,ruleId:data.ruleId||'',ruleName:data.ruleName||'',mode,quality:data.quality||'best',audioURL:data.audioURL||'',format:data.format||'mp4',sourcePage:data.sourcePage||'',mirrors:Array.isArray(data.mirrors)?data.mirrors:[]})});
     this.store.log('added',name,item.id);if(this.workerClient)this.workerClient.pendingDirty=true; if(!data.later) this.start(item.id).catch(()=>{});return item;
   }
   async start(id) {
@@ -86,12 +86,26 @@ class Engine extends EventEmitter {
     }else{ctx.segments=[];}
     if(!info.resumable){ctx.segments=[];fs.writeFileSync(ctx.temp,Buffer.alloc(0));}
     ctx.size=info.size;ctx.resumable=info.resumable;ctx.etag=info.etag;ctx.modified=info.modified;
+    // Optional mirrors are content-verified against this file before use, so
+    // segments can be shared between sources without risking corruption.
+    ctx.sources=[{url:item.url,primary:true}];
+    if(meta.mirrors?.length&&info.resumable&&info.size>0){
+      const verifyController=new AbortController();ctx.controllers.add(verifyController);
+      try{
+        const usable=await require('./mirrors.cjs').verified(item.url,info,meta.mirrors,{headersOf:url=>url===item.url?this.authHeaders(item.url,meta):this.mirrorHeaders(url),settings:this.settings(),signal:verifyController.signal});
+        for(const url of usable)ctx.sources.push({url,primary:false});
+        if(usable.length)this.store.log('mirror',`Using ${usable.length} verified mirror(s)`,item.id);
+        else this.store.log('mirror','No mirror matched this file; using the original source only',item.id);
+      }catch(error){if(!ctx.stopped)this.store.log('mirror',error.message,item.id);}
+      finally{ctx.controllers.delete(verifyController);}
+    }
+    if(ctx.stopped)return;
     ctx.fd=fs.openSync(ctx.temp,fs.existsSync(ctx.temp)?'r+':'w+');
     if(info.size)fs.ftruncateSync(ctx.fd,info.size);
     if(!ctx.segments.length)ctx.segments=[{id:1,start:0,current:0,end:info.size||Number.MAX_SAFE_INTEGER,state:'waiting'}];
     for(const s of ctx.segments)s.state=s.current>=s.end?'complete':'waiting';
     this.store.update(item.id,{...{size:info.size,resumable:info.resumable,etag:info.etag,modified:info.modified},status:'downloading',segments:ctx.segments});
-    const configured=info.resumable?Math.min(32,this.settings().serverConnections?.[ctx.host]||this.settings().connections):1,hint=this.hostHints[ctx.host];ctx.connectionLimit=Math.min(configured,hint&&Number.isInteger(hint.connections)&&hint.connections>=1&&hint.connections<=32&&Date.now()-hint.time<86400000?hint.connections:configured);ctx.retryAt=0;
+    const configured=info.resumable?Math.min(32,this.settings().serverConnections?.[ctx.host]||this.settings().connections):1,hint=this.hostHints[ctx.host];ctx.connectionLimit=Math.min(configured,hint&&Number.isInteger(hint.connections)&&hint.connections>=1&&hint.connections<=32&&Date.now()-hint.time<86400000?hint.connections:configured);ctx.retryAt=0;this.publishTransfer(ctx);
     let fatal;
     const workers=new Map();ctx.rebalance=new Set();
     const launch=s=>{
@@ -129,17 +143,17 @@ class Engine extends EventEmitter {
   async worker(ctx,s,baseHeaders){
     let attempts=ctx.retryAttempts.get(s.id)||0;
     while(s.current<s.end&&!ctx.stopped){
-      const ac=new AbortController();ctx.controllers.add(ac);ctx.segmentControllers||=new Map();ctx.segmentControllers.set(s.id,ac);let response,dataTimer,throttling=false,lastData=Date.now(),attemptStart=s.current;const usedHTTP1=ctx.http1;
+      const ac=new AbortController();ctx.controllers.add(ac);ctx.segmentControllers||=new Map();ctx.segmentControllers.set(s.id,ac);let response,dataTimer,throttling=false,lastData=Date.now(),attemptStart=s.current;const usedHTTP1=ctx.http1;let source={url:ctx.item.url,primary:true};
       try{
-        const headers={...baseHeaders};if(ctx.resumable){headers.range=`bytes=${s.current}-${s.end-1}`;if(ctx.etag&&!ctx.etag.startsWith('W/'))headers['if-range']=ctx.etag;else if(ctx.modified)headers['if-range']=ctx.modified;}
-        response=await request(ctx.item.url,{headers,signal:ac.signal,settings:this.settings(),http1:usedHTTP1});
+        source=ctx.sources&&ctx.sources.length?ctx.sources[s.id%ctx.sources.length]:{url:ctx.item.url,primary:true};const headers={...(source.primary?baseHeaders:this.mirrorHeaders(source.url))};if(ctx.resumable){headers.range=`bytes=${s.current}-${s.end-1}`;if(source.primary&&ctx.etag&&!ctx.etag.startsWith('W/'))headers['if-range']=ctx.etag;else if(source.primary&&ctx.modified)headers['if-range']=ctx.modified;}
+        response=await request(source.url,{headers,signal:ac.signal,settings:this.settings(),http1:usedHTTP1});
         if(response.statusCode>=400){const error=Error(`HTTP ${response.statusCode} — ${response.statusCode===429?'الخادم يطلب تقليل الاتصالات والمحاولة لاحقًا':'الخادم رفض طلب التحميل'}`);error.status=response.statusCode;error.retryAfter=response.headers['retry-after'];throw error;}
         if(ctx.resumable){
           const cr=/bytes (\d+)-(\d+)\/(\d+)/.exec(response.headers['content-range']||'');
           if(response.statusCode!==206||!cr||Number(cr[1])!==s.current||Number(cr[3])!==ctx.size){const error=Error(`HTTP ${response.statusCode} — الخادم لم يؤكد نطاق الاستئناف؛ تم إيقاف التحميل لمنع تلف الملف`);error.invalidRange=true;error.status=response.statusCode;throw error;}
           if(response.headers['content-encoding']&&response.headers['content-encoding']!=='identity')throw Error('لا يمكن تقسيم استجابة مضغوطة');
         }else if(response.statusCode!==200)throw Error(`HTTP ${response.statusCode}`);
-        if(ctx.etag&&response.headers.etag&&ctx.etag!==response.headers.etag||!this.settings().ignoreModified&&ctx.modified&&response.headers['last-modified']&&ctx.modified!==response.headers['last-modified'])throw Error('تغير الملف أثناء التحميل؛ تم إيقافه لمنع دمج نسخ مختلفة');
+        if(source.primary&&(ctx.etag&&response.headers.etag&&ctx.etag!==response.headers.etag||!this.settings().ignoreModified&&ctx.modified&&response.headers['last-modified']&&ctx.modified!==response.headers['last-modified']))throw Error('تغير الملف أثناء التحميل؛ تم إيقافه لمنع دمج نسخ مختلفة');
         if(!ctx.resumable&&ctx.size&&response.headers['content-length']!==undefined&&Number(response.headers['content-length'])!==ctx.size)throw Error('تغير حجم الملف بين الفحص وبدء التحميل');
         response.setTimeout?.(0);lastData=Date.now();dataTimer=setInterval(()=>{if(!ctx.stopped&&!throttling&&Date.now()-lastData>this.idleTimeout)response.destroy(Error('انتهت مهلة استقبال البيانات من الخادم'));},Math.min(1000,this.idleTimeout));dataTimer.unref();
         for await(const chunk of response){
@@ -161,6 +175,7 @@ class Engine extends EventEmitter {
       }catch(e){
         if(ctx.stopped)return;
         if(ctx.rebalance?.has(s.id)){s.state=s.current>=s.end?'complete':'waiting';return;}
+        if(!source.primary){ctx.sources=ctx.sources.filter(entry=>entry!==source);s.state=s.current<s.end?'waiting':'complete';this.store.log('mirror',`Mirror dropped after a failed request: ${new URL(source.url).hostname}`,ctx.id);this.publishTransfer(ctx);return;}
         if(e.invalidRange){if(!usedHTTP1){ctx.http1=true;this.reduceConnections(ctx,1);ctx.retryAt=Date.now()+500;s.state='waiting';return;}if(attempts<this.settings().retries){ctx.retryAttempts.set(s.id,++attempts);ctx.retryAt=Date.now()+Math.min(10000,this.settings().retryDelay*1000*attempts);s.state='waiting';this.store.log('retry',`Range confirmation retry ${attempts}; HTTP ${e.status}`,ctx.id);return;}throw e;}
         if(e.status&&![408,425,429,500,502,503,504].includes(e.status))throw e;
         if(s.current>attemptStart)attempts=0;
@@ -181,7 +196,34 @@ class Engine extends EventEmitter {
     if(file>0){ctx.fileNext=Math.max(now,ctx.fileNext)+n/file*1000;waitUntil=Math.max(waitUntil,ctx.fileNext);}
     while(!ctx.stopped&&Date.now()<waitUntil)await delay(Math.min(100,waitUntil-Date.now()));
   }
-  measure(ctx){const now=Date.now();if(now-ctx.lastTime<450)return;if(!ctx.speedSamples)ctx.speedSamples=[{time:ctx.lastTime,bytes:ctx.lastBytes}];ctx.speedSamples.push({time:now,bytes:ctx.received});while(ctx.speedSamples.length>2&&ctx.speedSamples[1].time<=now-3000)ctx.speedSamples.shift();const first=ctx.speedSamples[0];ctx.speed=Math.max(0,(ctx.received-first.bytes)/Math.max(.001,(now-first.time)/1000));ctx.lastBytes=ctx.received;ctx.lastTime=now;this.store.update(ctx.id,{speed:ctx.speed,downloaded:ctx.segments.reduce((n,s)=>n+s.current-s.start,0),segments:ctx.segments});}
+  measure(ctx){const now=Date.now();if(now-ctx.lastTime<450)return;if(!ctx.speedSamples)ctx.speedSamples=[{time:ctx.lastTime,bytes:ctx.lastBytes}];ctx.speedSamples.push({time:now,bytes:ctx.received});while(ctx.speedSamples.length>2&&ctx.speedSamples[1].time<=now-3000)ctx.speedSamples.shift();const first=ctx.speedSamples[0];ctx.speed=Math.max(0,(ctx.received-first.bytes)/Math.max(.001,(now-first.time)/1000));ctx.lastBytes=ctx.received;ctx.lastTime=now;this.store.update(ctx.id,{speed:ctx.speed,downloaded:ctx.segments.reduce((n,s)=>n+s.current-s.start,0),segments:ctx.segments});this.detectThrottle(ctx,now);}
+  // A per-connection cap is the one pattern worth acting on: when extra
+  // connections keep lifting total throughput, the site is metering each
+  // connection, so raising the count is the correct response. When extra
+  // connections add nothing, the source or network is already saturated and
+  // pushing harder would only provoke 429/503 responses.
+  detectThrottle(ctx,now){
+    if(!ctx.speed)return;
+    const state=ctx.throttle||(ctx.throttle={samples:[],capped:false,plateau:false,perConnectionKB:0,claimed:0,published:0});
+    if(now-(state.sampledAt||0)<1500)return;state.sampledAt=now;
+    const connections=Math.max(1,ctx.connectionLimit||1),cap=ctx.userConnectionCap||connections;
+    state.samples.push({time:now,connections,speed:ctx.speed});while(state.samples.length>5)state.samples.shift();
+    if(state.samples.length>=3){
+      const before=state.samples[state.samples.length-3],after=state.samples[state.samples.length-1];
+      if(after.connections>before.connections&&before.speed>0){
+        const scaling=(after.speed/before.speed)/(after.connections/before.connections);
+        // scaling is throughput gained per extra connection. Near 1 means each
+        // connection has its own ceiling (raise them); near 0 means the source
+        // is already saturated and more connections would only invite 429s.
+        if(scaling>=.8){state.capped=true;state.plateau=false;state.perConnectionKB=after.speed/after.connections/1024;if(connections<cap&&now-state.claimed>4000){ctx.connectionLimit=Math.min(cap,connections+2);state.claimed=now;this.rememberHost(ctx);}}
+        else if(scaling<=.5)state.plateau=true;
+      }
+    }
+    if(now-(state.published||0)>2000){state.published=now;this.publishTransfer(ctx);}
+  }
+  rememberHost(ctx){this.hostHints[ctx.host]={connections:ctx.connectionLimit,http1:ctx.http1,time:Date.now()};this.hostHints=Object.fromEntries(Object.entries(this.hostHints).sort((a,b)=>b[1].time-a[1].time).slice(0,200));this.store.set('transferHostHints',this.hostHints);}
+  publishTransfer(ctx){const item=this.store.find(ctx.id);if(!item)return;let meta;try{meta=JSON.parse(item.meta);}catch{return;}const t=ctx.throttle||{},mirrors=ctx.sources?ctx.sources.length:1;meta.transfer={connections:ctx.connectionLimit,http1:ctx.http1,mirrors,mirrorHosts:(ctx.sources||[]).filter(s=>!s.primary).map(s=>new URL(s.url).hostname),throttle:mirrors>1||t.capped||t.plateau?{capped:!!t.capped,plateau:!!t.plateau,perConnectionKB:Math.round(t.perConnectionKB||0)}:null};this.store.update(ctx.id,{meta:JSON.stringify(meta)});}
+  mirrorHeaders(url){return this.authHeaders(url,{});}
   checkpoint(ctx){
     if(ctx.fd!==null){try{fs.fsyncSync(ctx.fd);}catch{}}
     if(ctx.segments.length)this.store.update(ctx.id,{downloaded:ctx.segments.reduce((n,s)=>n+s.current-s.start,0),segments:ctx.segments});

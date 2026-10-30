@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.8.0
+
+- Download one file from several mirrors at once. A mirror is used only after Flow matches its size, its byte-range support and a 64 KB sample taken from the middle of the file against the original source, so a wrong or truncated mirror is skipped instead of corrupting the download. Verified sources share the existing segment map, and a mirror that fails mid-transfer is dropped while the rest continue.
+- Attach mirrors when adding a download from the desktop Add dialog, later from the file's own options (the file pauses, saves and resumes), from the Flow Companion popup, or from the phone Remote Control page. Up to eight links per file.
+- Detect a per-connection speed ceiling while the multi-chunk engine is adding connections: when each new connection keeps adding throughput, Flow raises the count itself up to your configured maximum and reports the measured rate per connection; when extra connections add nothing, it reports that the source or link is already saturated instead of provoking 429/503 responses.
+- Report the number of sources and the throttle verdict in the download details window.
+
+Mirrors are HTTP/HTTPS only and require the source to support resumable ranges. Torrent and magnet downloads already gather peers and are unchanged.
+
 ## 2.7.1
 
 - Fix replacement of an existing encrypted browser-bridge configuration on Windows PowerShell during upgrades and reconnects. Preserve atomic writes and protected tokens instead of treating a missing backup path as an empty filename.

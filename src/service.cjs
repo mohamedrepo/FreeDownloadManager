@@ -15,7 +15,7 @@ function validateAdd(data,store){
   if(data.category&&!['compressed','documents','music','programs','video','other'].includes(data.category))throw Error('تصنيف غير صالح');
   if(data.queueId&&!store.queues().some(q=>q.id===data.queueId))throw Error('قائمة الانتظار غير موجودة');
   if(data.directory&&!path.isAbsolute(data.directory))throw Error('مسار الحفظ يجب أن يكون مطلقاً');
-  return {url:data.url,name:data.name&&fileName(data.name),category:data.category,description:String(data.description||'').slice(0,2000),directory:data.directory,queueId:data.queueId,later:!!data.later,headers:cleanHeaders(data.headers),mode:require('./video.cjs').isVideoPage(data.url)||data.mode==='site'?'site':data.mode==='media'?'media':'file',quality:/^(best|audio|[a-z0-9_.-]{1,80})$/i.test(String(data.quality||'best'))?String(data.quality||'best'):'best',audioURL:data.audioURL,format:data.format==='mkv'?'mkv':'mp4',sourcePage:data.sourcePage,speedLimit:finiteNumber(data.speedLimit),priority:data.priority===undefined||data.priority===''?undefined:Math.max(-2,Math.min(2,Math.trunc(Number(data.priority)||0)))};
+  return {url:data.url,name:data.name&&fileName(data.name),category:data.category,description:String(data.description||'').slice(0,2000),directory:data.directory,queueId:data.queueId,later:!!data.later,headers:cleanHeaders(data.headers),mirrors:require('./mirrors.cjs').parseMirrors(data.mirrors,data.url),mode:require('./video.cjs').isVideoPage(data.url)||data.mode==='site'?'site':data.mode==='media'?'media':'file',quality:/^(best|audio|[a-z0-9_.-]{1,80})$/i.test(String(data.quality||'best'))?String(data.quality||'best'):'best',audioURL:data.audioURL,format:data.format==='mkv'?'mkv':'mp4',sourcePage:data.sourcePage,speedLimit:finiteNumber(data.speedLimit),priority:data.priority===undefined||data.priority===''?undefined:Math.max(-2,Math.min(2,Math.trunc(Number(data.priority)||0)))};
 }
 function validateSettings(patch){
   const result={};const {DEFAULTS}=require('./store.cjs');
@@ -65,7 +65,7 @@ class Service{
     const requestId=String(data.requestId||'');if(requestId&&!/^[a-z0-9:-]{1,100}$/i.test(requestId))throw Error('Invalid handoff identifier');
     const recent=this.store.get('browserRequests',[]),existing=recent.find(r=>r.id===requestId);if(existing&&this.store.find(existing.downloadId))return this.store.find(existing.downloadId);
     if(String(data.url).startsWith('magnet:')){const result=await this.peers.action('torrentAdd',{url:data.url});await this.desktop?.peerInfo?.();return {...result,name:'Torrent download',status:'active'};}
-    const validated=validateAdd({url:data.url,name:data.name,headers:data.headers,sourcePage:data.sourcePage,later:!!data.later,mode:data.mode},this.store);
+    const validated=validateAdd({url:data.url,name:data.name,headers:data.headers,sourcePage:data.sourcePage,later:!!data.later,mode:data.mode,mirrors:data.mirrors},this.store);
     if(this.store.settings.preventDuplicates){const duplicate=this.library.duplicates(validated.url)[0];if(duplicate){if(this.desktop){await this.desktop.downloadInfo?.(duplicate.id,duplicate.status);}return duplicate;}}
     let info;
     if(this.desktop&&!['media','site'].includes(validated.mode)&&/^https?:/.test(validated.url)){
@@ -138,7 +138,7 @@ class Service{
         const meta=JSON.parse(d.meta);if(data.url){net.validateURL(data.url);patch.url=data.url;if(new URL(data.url).origin!==new URL(d.url).origin){for(const key of ['cookie','authorization','referer','origin'])delete meta.headers[key];}}
         if(data.name)patch.name=fileName(data.name);if(data.description!==undefined)patch.description=String(data.description).slice(0,2000);
         if(data.queueId&&s.queues().some(q=>q.id===data.queueId))patch.queueId=data.queueId;
-        if(data.speedLimit!==undefined)meta.speedLimit=finiteNumber(data.speedLimit);patch.meta=JSON.stringify(meta);
+        if(data.speedLimit!==undefined)meta.speedLimit=finiteNumber(data.speedLimit);if(data.mirrors!==undefined)meta.mirrors=require('./mirrors.cjs').parseMirrors(data.mirrors,data.url||d.url);patch.meta=JSON.stringify(meta);
         return s.update(d.id,patch);
       }
       case'settings':{
